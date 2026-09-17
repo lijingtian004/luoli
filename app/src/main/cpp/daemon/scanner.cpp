@@ -50,6 +50,7 @@ bool Scanner::listRegions(pid_t pid, bool writableOnly, std::vector<Region> &out
         while (*perms == ' ') ++perms;
         bool r = perms[0] == 'r';
         bool w = perms[1] == 'w';
+        bool x = perms[2] == 'x';
         if (!r || (writableOnly && !w)) continue;
 
         // path：跳过前 5 个字段 (start-end, perms, offset, dev, inode)
@@ -71,7 +72,7 @@ bool Scanner::listRegions(pid_t pid, bool writableOnly, std::vector<Region> &out
         if (name.rfind("/dev/", 0) == 0) continue;
         if (name == "[vvar]" || name == "[vvar_vdso]" || name == "[vectors]") continue;
 
-        out.push_back(Region{start, end, name, classifyTag(name), w});
+        out.push_back(Region{start, end, name, classifyTag(name, x), w, r, x});
     }
     fclose(f);
     return true;
@@ -88,6 +89,139 @@ bool Scanner::listModules(pid_t pid, std::vector<Module> &out) {
             out.push_back(Module{rg.path, rg.start, rg.end});
         }
     }
+    return true;
+}
+
+bool Scanner::inspectArchitecture(pid_t pid, AppArchitectureSummary &out) {
+    if (pid <= 0) return false;
+    out = AppArchitectureSummary();
+
+    // 1. 读取 /proc/<pid>/exe 的 ELF Header 判断架构位数与机器类型
+    int bitness = 0;
+    std::string archStr;
+    char exePath[64];
+    snprintf(exePath, sizeof(exePath), "/proc/%d/exe", pid);
+    FILE *f = fopen(exePath, "rb");
+    if (f) {
+        uint8_t header[64];
+        size_t rd = fread(header, 1, sizeof(header), f);
+        fclose(f);
+        if (rd >= 20 && header[0] == 0x7f && header[1] == 'E' && header[2] == 'L' && header[3] == 'F') {
+            uint8_t elfClass = header[4]; // 1: 32-bit, 2: 64-bit
+            uint16_t e_machine = (uint16_t)(header[18] | (header[19] << 8));
+            if (elfClass == 1) {
+                bitness = 32;
+                if (e_machine == 40) archStr = "ARM (32-bit)";
+                else if (e_machine == 3) archStr = "x86 (32-bit)";
+                else archStr = "32-bit";
+            } else if (elfClass == 2) {
+                bitness = 64;
+                if (e_machine == 183) archStr = "AArch64 (64-bit)";
+                else if (e_machine == 62) archStr = "x86_64 (64-bit)";
+                else archStr = "64-bit";
+            }
+        }
+    }
+
+    // 2. 检索已加载模块
+    std::vector<Module> modules;
+    listModules(pid, modules);
+
+    // 若 /proc/<pid>/exe 无法打开（如某些安全沙箱），通过模块地址空间寻址跨度做保底
+    if (bitness == 0) {
+        bool hasHighAddr = false;
+        for (const auto &m : modules) {
+            if (m.base > 0xFFFFFFFFULL || m.end > 0xFFFFFFFFULL) {
+                hasHighAddr = true;
+                break;
+            }
+        }
+        if (hasHighAddr) {
+            bitness = 64;
+            archStr = "AArch64 (64-bit)";
+        } else {
+            bitness = 32;
+            archStr = "ARM (32-bit)";
+        }
+    }
+    out.bitness = bitness;
+    out.arch = archStr;
+
+    // 3. 提取引擎指纹与核心模块
+    bool hasIl2cpp = false;
+    bool hasMono = false;
+    bool hasUnity = false;
+    bool hasUE4 = false;
+    bool hasUE5 = false;
+    bool hasCocos = false;
+    bool hasGodot = false;
+    bool hasFlutter = false;
+    bool hasAppNative = false;
+
+    std::vector<CoreModuleInfo> engineLibs;
+    std::vector<CoreModuleInfo> appLibs;
+    std::vector<CoreModuleInfo> runtimeLibs;
+
+    for (const auto &m : modules) {
+        if (m.name.empty()) continue;
+
+        size_t slash = m.name.rfind('/');
+        std::string fileName = (slash != std::string::npos) ? m.name.substr(slash + 1) : m.name;
+
+        if (fileName == "libil2cpp.so") hasIl2cpp = true;
+        else if (fileName == "libmono.so" || fileName == "libmonosgen-2.0.so") hasMono = true;
+        else if (fileName == "libunity.so") hasUnity = true;
+        else if (fileName == "libUE4.so" || fileName == "libUnreal.so") hasUE4 = true;
+        else if (fileName == "libUE5.so" || fileName == "libUnrealEngine.so") hasUE5 = true;
+        else if (fileName.find("cocos2d") != std::string::npos || fileName == "libcocos.so") hasCocos = true;
+        else if (fileName == "libgodot_android.so") hasGodot = true;
+        else if (fileName == "libflutter.so") hasFlutter = true;
+
+        CoreModuleInfo cinfo{fileName, m.base, m.end, (size_t)(m.end - m.base), m.name};
+        bool isEngineLib = (fileName == "libil2cpp.so" || fileName == "libunity.so" ||
+                            fileName == "libmono.so" || fileName == "libmonosgen-2.0.so" ||
+                            fileName == "libUE4.so" || fileName == "libUE5.so" ||
+                            fileName == "libUnreal.so" || fileName.find("cocos2d") != std::string::npos ||
+                            fileName == "libgodot_android.so" || fileName == "libflutter.so");
+
+        bool isAppPath = (m.name.find("/data/app/") != std::string::npos ||
+                          m.name.find("/data/user/") != std::string::npos ||
+                          m.name.find("/data/data/") != std::string::npos);
+
+        if (isEngineLib) {
+            engineLibs.push_back(cinfo);
+        } else if (isAppPath && fileName.rfind(".so") != std::string::npos) {
+            hasAppNative = true;
+            appLibs.push_back(cinfo);
+        } else if (fileName == "libart.so" || fileName == "libc.so" || fileName == "libbase.so") {
+            runtimeLibs.push_back(cinfo);
+        }
+    }
+
+    if (hasIl2cpp) out.engine = "Unity (IL2CPP)";
+    else if (hasMono) out.engine = "Unity (Mono)";
+    else if (hasUnity) out.engine = "Unity";
+    else if (hasUE5) out.engine = "Unreal Engine 5";
+    else if (hasUE4) out.engine = "Unreal Engine 4";
+    else if (hasCocos) out.engine = "Cocos2d";
+    else if (hasGodot) out.engine = "Godot";
+    else if (hasFlutter) out.engine = "Flutter";
+    else if (hasAppNative) out.engine = "Native (C/C++)";
+    else out.engine = "Android Java / ART";
+
+    for (const auto &e : engineLibs) {
+        if (out.coreModules.size() >= 15) break;
+        out.coreModules.push_back(e);
+    }
+    for (const auto &a : appLibs) {
+        if (out.coreModules.size() >= 15) break;
+        out.coreModules.push_back(a);
+    }
+    for (const auto &r : runtimeLibs) {
+        if (out.coreModules.size() >= 15) break;
+        out.coreModules.push_back(r);
+    }
+
     return true;
 }
 
@@ -158,6 +292,142 @@ bool Scanner::singleWrite(pid_t pid, uint64_t addr, VT type, uint64_t raw) const
     return g_driver->writeMem(pid, addr, &raw, vtSize(type));
 }
 
+bool Scanner::readBytes(pid_t pid, uint64_t addr, size_t size, std::vector<uint8_t> &out) const {
+    out.clear();
+    if (!g_driver || !g_driver->ready() || size == 0 || addr == 0) return false;
+    out.resize(size, 0);
+    size_t got = readContiguous(pid, addr, out.data(), size);
+    if (got == 0) {
+        out.clear();
+        return false;
+    }
+    out.resize(got);
+    return true;
+}
+
+bool Scanner::readStruct(pid_t pid, uint64_t baseAddr,
+                         const std::vector<StructFieldDef> &fields,
+                         std::vector<StructFieldValue> &out) const {
+    out.clear();
+    if (!g_driver || !g_driver->ready() || baseAddr == 0 || fields.empty()) return false;
+    out.reserve(fields.size());
+
+    int64_t minOff = 0;
+    int64_t maxEnd = 0;
+    bool first = true;
+
+    for (const auto &f : fields) {
+        size_t sz = f.isString ? f.strLen : (f.isPointer ? 8 : vtSize(f.type));
+        if (sz == 0) sz = 4;
+        int64_t endOff = f.offset + (int64_t)sz;
+        if (first) {
+            minOff = f.offset;
+            maxEnd = endOff;
+            first = false;
+        } else {
+            minOff = std::min(minOff, f.offset);
+            maxEnd = std::max(maxEnd, endOff);
+        }
+    }
+
+    std::vector<uint8_t> bulkBuf;
+    bool bulkOk = false;
+    int64_t totalSpan = maxEnd - minOff;
+    if (minOff >= 0 && totalSpan > 0 && totalSpan <= 65536) {
+        bulkBuf.resize((size_t)totalSpan, 0);
+        size_t rd = readContiguous(pid, baseAddr + minOff, bulkBuf.data(), (size_t)totalSpan);
+        if (rd == (size_t)totalSpan) {
+            bulkOk = true;
+        }
+    }
+
+    for (const auto &f : fields) {
+        StructFieldValue val;
+        val.name = f.name.empty() ? ("field_" + std::to_string(f.offset)) : f.name;
+        val.offset = f.offset;
+        val.addr = baseAddr + f.offset;
+        val.type = f.typeStr;
+        val.isPointer = f.isPointer;
+        val.isString = f.isString;
+
+        size_t sz = f.isString ? f.strLen : (f.isPointer ? 8 : vtSize(f.type));
+        if (sz == 0) sz = 4;
+
+        if (bulkOk) {
+            size_t rel = (size_t)(f.offset - minOff);
+            if (f.isString) {
+                const char *p = (const char *)(bulkBuf.data() + rel);
+                size_t maxLen = std::min(sz, (size_t)(totalSpan - rel));
+                size_t actualLen = strnlen(p, maxLen);
+                val.strValue = std::string(p, actualLen);
+                val.ok = true;
+            } else {
+                uint64_t raw = 0;
+                memcpy(&raw, bulkBuf.data() + rel, std::min(sz, sizeof(raw)));
+                val.raw = raw;
+                if (f.isPointer) {
+                    raw &= 0xFFFFFFFFFFFFULL;
+                    char pbuf[32];
+                    snprintf(pbuf, sizeof(pbuf), "0x%llx", (unsigned long long)raw);
+                    val.strValue = pbuf;
+                    val.numValue = (double)raw;
+                } else if (f.type == VT::F32) {
+                    float fv = 0.0f;
+                    memcpy(&fv, &raw, 4);
+                    val.numValue = (double)fv;
+                } else if (f.type == VT::F64) {
+                    double dv = 0.0;
+                    memcpy(&dv, &raw, 8);
+                    val.numValue = dv;
+                } else {
+                    val.numValue = (double)raw;
+                }
+                val.ok = true;
+            }
+        } else {
+            if (f.isString) {
+                std::vector<uint8_t> sbuf(sz + 1, 0);
+                size_t rd = readContiguous(pid, val.addr, sbuf.data(), sz);
+                if (rd > 0) {
+                    sbuf[rd] = 0;
+                    val.strValue = std::string((char *)sbuf.data());
+                    val.ok = true;
+                }
+            } else if (f.isPointer) {
+                uint64_t raw = 0;
+                if (singleRead(pid, val.addr, VT::U64, raw)) {
+                    val.raw = raw;
+                    raw &= 0xFFFFFFFFFFFFULL;
+                    char pbuf[32];
+                    snprintf(pbuf, sizeof(pbuf), "0x%llx", (unsigned long long)raw);
+                    val.strValue = pbuf;
+                    val.numValue = (double)raw;
+                    val.ok = true;
+                }
+            } else {
+                uint64_t raw = 0;
+                if (singleRead(pid, val.addr, f.type, raw)) {
+                    val.raw = raw;
+                    if (f.type == VT::F32) {
+                        float fv = 0.0f;
+                        memcpy(&fv, &raw, 4);
+                        val.numValue = (double)fv;
+                    } else if (f.type == VT::F64) {
+                        double dv = 0.0;
+                        memcpy(&dv, &raw, 8);
+                        val.numValue = dv;
+                    } else {
+                        val.numValue = (double)raw;
+                    }
+                    val.ok = true;
+                }
+            }
+        }
+        out.push_back(val);
+    }
+    return true;
+}
+
 // ---------- 初扫 ----------
 
 bool Scanner::search(pid_t pid, const ScanOptions &opt, std::vector<Hit> &hits,
@@ -179,7 +449,7 @@ bool Scanner::search(pid_t pid, const ScanOptions &opt, std::vector<Hit> &hits,
         if (!opt.tags.empty()) {
             bool tagMatch = false;
             for (const auto &t : opt.tags) {
-                if (strcasecmp(t.c_str(), rg.tag.c_str()) == 0) {
+                if (matchRegionTag(rg, t)) {
                     tagMatch = true;
                     break;
                 }
@@ -510,7 +780,7 @@ bool Scanner::searchGroup(pid_t pid, const GroupScanOptions &opt, std::vector<Hi
         if (!opt.tags.empty()) {
             bool tagMatch = false;
             for (const auto &t : opt.tags) {
-                if (strcasecmp(t.c_str(), rg.tag.c_str()) == 0) { tagMatch = true; break; }
+                if (matchRegionTag(rg, t)) { tagMatch = true; break; }
             }
             if (!tagMatch) continue;
         }
@@ -652,26 +922,55 @@ bool Scanner::searchGroup(pid_t pid, const GroupScanOptions &opt, std::vector<Hi
 // ---------- 指针扫描器 ----------
 
 bool Scanner::findPointers(pid_t pid, uint64_t targetAddr, int64_t maxOffset, size_t align,
-                           const std::vector<std::string> &tags, std::vector<PointerHit> &out) const {
+                           const std::vector<std::string> &tags,
+                           const std::string &scope,
+                           const std::string &nameFilter,
+                           std::vector<PointerHit> &out) const {
     if (!g_driver || !g_driver->ready() || targetAddr == 0) return false;
 
     std::vector<Region> regions;
-    if (!listRegions(pid, true, regions)) return false;
+    // 解除仅限可写段硬编码：全量获取段信息，按需检索只读数据段与代码段
+    if (!listRegions(pid, false, regions)) return false;
 
     std::vector<Module> modules;
     listModules(pid, modules);
 
+    std::string sc = scope;
+    std::transform(sc.begin(), sc.end(), sc.begin(), ::tolower);
+    if (sc.empty()) sc = "all";
+
     std::vector<Region> chosen;
     for (auto &rg : regions) {
+        // 1. scope 段类型/权限过滤
+        if (sc == "writable" || sc == "data") {
+            if (!rg.writable) continue;
+        } else if (sc == "rodata" || sc == "ro") {
+            if (!(rg.readable && !rg.writable && !rg.executable)) continue;
+        } else if (sc == "code" || sc == "text") {
+            if (!rg.executable) continue;
+        } else if (sc == "data_and_rodata") {
+            if (rg.executable) continue;
+        }
+
+        // 2. 模块名/路径过滤
+        if (!nameFilter.empty()) {
+            std::string lp = rg.path, lf = nameFilter;
+            std::transform(lp.begin(), lp.end(), lp.begin(), ::tolower);
+            std::transform(lf.begin(), lf.end(), lf.begin(), ::tolower);
+            if (lp.find(lf) == std::string::npos) continue;
+        }
+
+        // 3. 标签过滤
         if (!tags.empty()) {
             bool tagMatch = false;
             for (const auto &t : tags) {
-                if (strcasecmp(t.c_str(), rg.tag.c_str()) == 0) { tagMatch = true; break; }
+                if (matchRegionTag(rg, t)) { tagMatch = true; break; }
             }
             if (!tagMatch) continue;
         } else {
-            // 默认优先扫描静态 BSS、堆与匿名段
-            if (rg.tag != "B" && rg.tag != "Jh" && rg.tag != "Ch" && rg.tag != "Cd" && rg.tag != "A") {
+            // 默认优先扫描静态 BSS、模块段（Ca/Cd/Xa，含只读数据与代码段）、堆（Jh/Ch）与匿名段（A）
+            // 支持全局虚表、反射元数据表及常量指针数组，排除栈段（S）及设备/特殊段（O）
+            if (rg.tag == "S" || rg.tag == "O") {
                 continue;
             }
         }
@@ -737,7 +1036,7 @@ bool Scanner::findPointers(pid_t pid, uint64_t targetAddr, int64_t maxOffset, si
                         }
                     }
 
-                    out.push_back(PointerHit{pAddr, matchedVal, diff, rg.tag, modDesc});
+                    out.push_back(PointerHit{pAddr, matchedVal, diff, rg.tag, modDesc, rg.writable});
                     if (out.size() >= 1000) return true; // Cap to 1000 pointers
                 }
             }
@@ -747,10 +1046,193 @@ bool Scanner::findPointers(pid_t pid, uint64_t targetAddr, int64_t maxOffset, si
     return true;
 }
 
+// ---------- 代码交叉引用反查 (AArch64 XRef Scanner) ----------
+
+bool Scanner::findCodeXrefs(pid_t pid, uint64_t targetAddr,
+                           const std::string &nameFilter,
+                           size_t maxResults,
+                           std::vector<CodeXRefHit> &out) const {
+    out.clear();
+    if (!g_driver || !g_driver->ready() || targetAddr == 0) return false;
+    if (maxResults == 0) maxResults = 50;
+    if (maxResults > 500) maxResults = 500;
+
+    std::vector<Region> regions;
+    if (!listRegions(pid, false, regions)) return false;
+
+    std::vector<Module> modules;
+    listModules(pid, modules);
+
+    auto formatModuleOffset = [&](uint64_t pc) -> std::string {
+        for (const auto &m : modules) {
+            if (pc >= m.base && pc < m.end) {
+                char b[64];
+                snprintf(b, sizeof(b), "+0x%llx", (unsigned long long)(pc - m.base));
+                size_t slash = m.name.rfind('/');
+                std::string baseName = (slash != std::string::npos) ? m.name.substr(slash + 1) : m.name;
+                return baseName + b;
+            }
+        }
+        char b[32];
+        snprintf(b, sizeof(b), "0x%llx", (unsigned long long)pc);
+        return b;
+    };
+
+    std::vector<Region> codeRegions;
+    for (const auto &rg : regions) {
+        if (!rg.executable) continue;
+
+        if (!nameFilter.empty()) {
+            std::string lp = rg.path, lf = nameFilter;
+            std::transform(lp.begin(), lp.end(), lp.begin(), ::tolower);
+            std::transform(lf.begin(), lf.end(), lf.begin(), ::tolower);
+            if (lp.find(lf) == std::string::npos) continue;
+        } else {
+            bool isApp = (rg.tag == "Xa" || rg.tag == "Ca" ||
+                          rg.path.find("/data/app/") != std::string::npos ||
+                          rg.path.find("/data/user/") != std::string::npos ||
+                          rg.path.find("libil2cpp.so") != std::string::npos);
+            if (!isApp && rg.tag == "Xs") continue;
+        }
+        codeRegions.push_back(rg);
+    }
+    if (codeRegions.empty()) return false;
+
+    uint64_t targetPage = targetAddr & ~0xFFFULL;
+    size_t kChunk = 512 * 1024;
+    std::unique_ptr<uint8_t[]> buf(new (std::nothrow) uint8_t[kChunk + 64]);
+    if (!buf) return false;
+
+    for (const auto &rg : codeRegions) {
+        uint64_t pos = rg.start;
+        while (pos < rg.end && out.size() < maxResults) {
+            size_t want = (size_t)std::min<uint64_t>(kChunk, rg.end - pos);
+            size_t got = readContiguous(pid, pos, buf.get(), want);
+            if (got < 4) {
+                pos += (want ? want : 4);
+                continue;
+            }
+
+            size_t limit = got - (got % 4);
+            for (size_t off = 0; off + 4 <= limit && out.size() < maxResults; off += 4) {
+                uint64_t pc = pos + off;
+                uint32_t insn = *(uint32_t *)(buf.get() + off);
+
+                // 1. ADRP: op 00 10000 (bit 31 is 1)
+                if ((insn & 0x9F000000) == 0x90000000) {
+                    uint32_t immlo = (insn >> 29) & 0x3;
+                    uint32_t immhi = (insn >> 5) & 0x7FFFF;
+                    uint64_t immRaw = ((uint64_t)immhi << 2) | immlo;
+                    uint64_t m = 1ULL << 20;
+                    int64_t imm = (int64_t)((immRaw ^ m) - m);
+                    uint64_t adrpPage = (pc & ~0xFFFULL) + (imm << 12);
+                    int rd = insn & 0x1F;
+
+                    if (adrpPage == targetPage) {
+                        for (int k = 1; k <= 4 && off + k * 4 + 4 <= limit; ++k) {
+                            uint64_t pc2 = pc + k * 4;
+                            uint32_t insn2 = *(uint32_t *)(buf.get() + off + k * 4);
+
+                            // a) ADD (immediate)
+                            if ((insn2 & 0x1F000000) == 0x11000000) {
+                                bool op = (insn2 >> 30) & 1;
+                                bool s = (insn2 >> 29) & 1;
+                                if (!op && !s) {
+                                    int rn = (insn2 >> 5) & 0x1F;
+                                    if (rn == rd) {
+                                        int shift = (insn2 >> 22) & 3;
+                                        uint32_t imm12 = (insn2 >> 10) & 0xFFF;
+                                        uint64_t addVal = (shift == 1) ? (imm12 << 12) : imm12;
+                                        if (adrpPage + addVal == targetAddr) {
+                                            std::string m1, o1, m2, o2;
+                                            decodeArm64(insn, pc, m1, o1);
+                                            decodeArm64(insn2, pc2, m2, o2);
+                                            std::string disasm = m1 + " " + o1 + " ; " + m2 + " " + o2;
+                                            std::string modDesc = formatModuleOffset(pc);
+                                            out.push_back(CodeXRefHit{pc, "ADRP+ADD", disasm, modDesc, targetAddr});
+                                            break;
+                                        }
+                                    }
+                                }
+                            }
+
+                            // b) LDR / STR (unsigned immediate)
+                            if ((insn2 & 0x3B200C00) == 0x39000000) {
+                                int rn = (insn2 >> 5) & 0x1F;
+                                if (rn == rd) {
+                                    int size = (insn2 >> 30) & 3;
+                                    int opc = (insn2 >> 22) & 3;
+                                    uint32_t imm12 = (insn2 >> 10) & 0xFFF;
+                                    uint64_t ldrOff = (uint64_t)imm12 << size;
+                                    if (adrpPage + ldrOff == targetAddr) {
+                                        std::string m1, o1, m2, o2;
+                                        decodeArm64(insn, pc, m1, o1);
+                                        decodeArm64(insn2, pc2, m2, o2);
+                                        std::string disasm = m1 + " " + o1 + " ; " + m2 + " " + o2;
+                                        std::string modDesc = formatModuleOffset(pc);
+                                        bool isLoad = (opc == 1);
+                                        out.push_back(CodeXRefHit{pc, isLoad ? "ADRP+LDR" : "ADRP+STR", disasm, modDesc, targetAddr});
+                                        break;
+                                    }
+                                }
+                            }
+
+                            int curRd = insn2 & 0x1F;
+                            if (curRd == rd && curRd != 31) break;
+                        }
+                    }
+                }
+
+                // 2. ADR: op 00 10000 (bit 31 is 0)
+                if ((insn & 0x9F000000) == 0x10000000) {
+                    uint32_t immlo = (insn >> 29) & 0x3;
+                    uint32_t immhi = (insn >> 5) & 0x7FFFF;
+                    uint64_t immRaw = ((uint64_t)immhi << 2) | immlo;
+                    uint64_t m = 1ULL << 20;
+                    int64_t imm = (int64_t)((immRaw ^ m) - m);
+                    if (pc + imm == targetAddr) {
+                        std::string m1, o1;
+                        decodeArm64(insn, pc, m1, o1);
+                        std::string modDesc = formatModuleOffset(pc);
+                        out.push_back(CodeXRefHit{pc, "ADR", m1 + " " + o1, modDesc, targetAddr});
+                    }
+                }
+
+                // 3. LDR literal
+                if ((insn & 0xBF000000) == 0x18000000) {
+                    uint64_t immRaw = (uint64_t)((insn >> 5) & 0x7FFFF) << 2;
+                    uint64_t m = 1ULL << 20;
+                    int64_t imm = (int64_t)((immRaw ^ m) - m);
+                    if (pc + imm == targetAddr) {
+                        std::string m1, o1;
+                        decodeArm64(insn, pc, m1, o1);
+                        std::string modDesc = formatModuleOffset(pc);
+                        out.push_back(CodeXRefHit{pc, "LDR_LITERAL", m1 + " " + o1, modDesc, targetAddr});
+                    }
+                }
+
+                // 4. 文字池对齐指针
+                if (off + 8 <= limit && (off % 8 == 0)) {
+                    uint64_t val64 = *(uint64_t *)(buf.get() + off);
+                    if (val64 == targetAddr) {
+                        char b[64];
+                        snprintf(b, sizeof(b), ".quad 0x%llx", (unsigned long long)val64);
+                        std::string modDesc = formatModuleOffset(pc);
+                        out.push_back(CodeXRefHit{pc, "LITERAL_PTR", b, modDesc, targetAddr});
+                    }
+                }
+            }
+            pos += got;
+        }
+    }
+    return !out.empty();
+}
+
 // ---------- 字符串搜索 ----------
 
 bool Scanner::searchString(pid_t pid, const std::string &text, const std::string &encoding,
                            const std::string &nameFilter, const std::vector<std::string> &tags,
+                           const std::string &scope,
                            uint64_t maxResults, std::vector<Hit> &hits, std::mutex &hitsMu,
                            uint64_t &totalOut, bool &truncatedOut) {
     if (!g_driver || !g_driver->ready() || text.empty()) return false;
@@ -767,17 +1249,53 @@ bool Scanner::searchString(pid_t pid, const std::string &text, const std::string
     if (pattern.empty()) return false;
 
     std::vector<Region> regions;
-    if (!listRegions(pid, true, regions)) return false;
+    // 允许按需检索所有可读段（包含只读数据段与代码段），不再硬编码仅检索可写段
+    if (!listRegions(pid, false, regions)) return false;
+
+    std::string sc = scope;
+    std::transform(sc.begin(), sc.end(), sc.begin(), ::tolower);
+    if (sc.empty()) sc = "writable";
 
     std::vector<Region> chosen;
     for (auto &rg : regions) {
+        // 1. scope 段类型与权限过滤
+        if (sc == "rodata" || sc == "ro") {
+            // 纯只读数据段：可读、不可写、不可执行（如常量字符串池、反射元数据表）
+            if (!(rg.readable && !rg.writable && !rg.executable)) continue;
+        } else if (sc == "code" || sc == "text") {
+            // 可执行代码段
+            if (!rg.executable) continue;
+        } else if (sc == "all") {
+            // 全段：所有可读段（可写、只读数据、代码段）
+            if (!rg.readable) continue;
+        } else if (sc == "include_rodata") {
+            // 可写段 + 只读数据段（排除代码段）
+            if (rg.executable) continue;
+        } else {
+            // 默认 writable 模式：检索可写段；若 tags 显式指定只读/代码标签则宽容匹配
+            bool tagWantsNonWritable = false;
+            for (const auto &t : tags) {
+                if (strcasecmp(t.c_str(), "rodata") == 0 || strcasecmp(t.c_str(), "ro") == 0 ||
+                    strcasecmp(t.c_str(), "code") == 0 || strcasecmp(t.c_str(), "text") == 0 ||
+                    strcasecmp(t.c_str(), "Xa") == 0 || strcasecmp(t.c_str(), "Xs") == 0 ||
+                    strcasecmp(t.c_str(), "all") == 0) {
+                    tagWantsNonWritable = true;
+                    break;
+                }
+            }
+            if (!tagWantsNonWritable && !rg.writable) continue;
+        }
+
+        // 2. 标签过滤
         if (!tags.empty()) {
             bool tagMatch = false;
             for (const auto &t : tags) {
-                if (strcasecmp(t.c_str(), rg.tag.c_str()) == 0) { tagMatch = true; break; }
+                if (matchRegionTag(rg, t)) { tagMatch = true; break; }
             }
             if (!tagMatch) continue;
         }
+
+        // 3. 模块路径子串过滤
         if (!nameFilter.empty()) {
             std::string lp = rg.path, lf = nameFilter;
             std::transform(lp.begin(), lp.end(), lp.begin(), ::tolower);
@@ -958,7 +1476,7 @@ bool Scanner::searchPattern(pid_t pid, const std::string &patternStr, size_t ali
         if (!tags.empty()) {
             bool tagMatch = false;
             for (const auto &t : tags) {
-                if (strcasecmp(t.c_str(), rg.tag.c_str()) == 0) { tagMatch = true; break; }
+                if (matchRegionTag(rg, t)) { tagMatch = true; break; }
             }
             if (!tagMatch) continue;
         }

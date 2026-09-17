@@ -34,6 +34,7 @@ struct Il2CppStatus {
     std::string modulePath;
     bool hasMetadata = false;
     uint64_t metadataAddr = 0;
+    int32_t metadataVersion = 0;
     size_t apiCount = 0;
 };
 

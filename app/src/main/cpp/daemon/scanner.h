@@ -4,9 +4,11 @@
 #include <atomic>
 #include <condition_variable>
 #include <cstdint>
+#include <cstring>
 #include <functional>
 #include <mutex>
 #include <string>
+#include <strings.h>
 #include <vector>
 
 #include "common.h"
@@ -17,15 +19,17 @@ namespace eng { extern twt::Driver *g_driver; }
 namespace eng {
 
 struct Region {
-    uint64_t start;
-    uint64_t end;      // 排他
-    std::string path;  // 可能为空（匿名）
-    std::string tag;   // Jh, Ch, A, B, Ca, Cd, S, O
-    bool writable;
+    uint64_t start = 0;
+    uint64_t end = 0;      // 排他
+    std::string path;      // 可能为空（匿名）
+    std::string tag;       // Jh, Ch, A, B, Ca, Cd, S, O, Xa, Xs
+    bool writable = false;
+    bool readable = true;
+    bool executable = false;
 };
 
 // 内存段类型分类
-inline std::string classifyTag(const std::string &path) {
+inline std::string classifyTag(const std::string &path, bool executable = false) {
     if (path.empty() || path == "[anon]") return "A";
     if (path == "[heap]") return "Ch";
     if (path.find("bionic_alloc") != std::string::npos ||
@@ -49,10 +53,35 @@ inline std::string classifyTag(const std::string &path) {
         path.find("thread signal stack") != std::string::npos) return "S";
     if (path.find("/data/app/") != std::string::npos ||
         path.find("/data/data/") != std::string::npos ||
-        path.find("/data/user/") != std::string::npos) return "Ca";
-    if (path.rfind("/", 0) == 0) return "Cd";
+        path.find("/data/user/") != std::string::npos) {
+        return executable ? "Xa" : "Ca";
+    }
+    if (path.rfind("/", 0) == 0) {
+        return executable ? "Xs" : "Cd";
+    }
     if (path.rfind("[anon:", 0) == 0) return "A";
     return "O";
+}
+
+// 标签与内存权限属性匹配
+inline bool matchRegionTag(const Region &rg, const std::string &t) {
+    if (strcasecmp(t.c_str(), "all") == 0) return true;
+    if (strcasecmp(t.c_str(), "rodata") == 0 || strcasecmp(t.c_str(), "ro") == 0) {
+        return rg.readable && !rg.writable && !rg.executable;
+    }
+    if (strcasecmp(t.c_str(), "code") == 0 || strcasecmp(t.c_str(), "text") == 0) {
+        return rg.executable;
+    }
+    if (strcasecmp(t.c_str(), "data") == 0) {
+        return rg.writable;
+    }
+    if (strcasecmp(t.c_str(), "Ca") == 0) {
+        return rg.tag == "Ca" || rg.tag == "Xa";
+    }
+    if (strcasecmp(t.c_str(), "Cd") == 0) {
+        return rg.tag == "Cd" || rg.tag == "Xs";
+    }
+    return strcasecmp(t.c_str(), rg.tag.c_str()) == 0;
 }
 
 struct ScanProgress {
@@ -118,6 +147,7 @@ struct PointerHit {
     int64_t offset = 0;
     std::string regionTag;
     std::string moduleName;
+    bool writable = true;
 };
 
 // 多级指针链解析步骤
@@ -175,6 +205,25 @@ public:
     struct Module { std::string name; uint64_t base; uint64_t end; };
     static bool listModules(pid_t pid, std::vector<Module> &out);
 
+    // 核心模块信息
+    struct CoreModuleInfo {
+        std::string name;
+        uint64_t base = 0;
+        uint64_t end = 0;
+        size_t size = 0;
+        std::string path;
+    };
+
+    // 应用架构与核心特征摘要
+    struct AppArchitectureSummary {
+        int bitness = 64;
+        std::string arch = "AArch64 (64-bit)";
+        std::string engine = "Native (C/C++)";
+        std::vector<CoreModuleInfo> coreModules;
+    };
+
+    static bool inspectArchitecture(pid_t pid, AppArchitectureSummary &out);
+
     Scanner() = default;
 
     void setRateLimit(uint64_t bytesPerSec) { rate_ = bytesPerSec ? bytesPerSec : 1; }
@@ -191,6 +240,38 @@ public:
     bool singleRead(pid_t pid, uint64_t addr, VT type, uint64_t &rawOut) const;
     bool singleWrite(pid_t pid, uint64_t addr, VT type, uint64_t raw) const;
 
+    // 直接读取连续内存块（不落盘）
+    bool readBytes(pid_t pid, uint64_t addr, size_t size, std::vector<uint8_t> &out) const;
+
+    // 结构体多字段读取定义与结果
+    struct StructFieldDef {
+        std::string name;
+        int64_t offset = 0;
+        std::string typeStr = "i32";
+        VT type = VT::I32;
+        bool isPointer = false;
+        bool isString = false;
+        size_t strLen = 32;
+    };
+
+    struct StructFieldValue {
+        std::string name;
+        int64_t offset = 0;
+        uint64_t addr = 0;
+        std::string type;
+        double numValue = 0.0;
+        std::string strValue;
+        uint64_t raw = 0;
+        bool isPointer = false;
+        bool isString = false;
+        bool ok = false;
+    };
+
+    // 结构体/多字段联动读取
+    bool readStruct(pid_t pid, uint64_t baseAddr,
+                    const std::vector<StructFieldDef> &fields,
+                    std::vector<StructFieldValue> &out) const;
+
     // 内存临域探查
     bool inspectMemory(pid_t pid, uint64_t centerAddr, int countBefore, int countAfter, size_t unitSize, MemoryInspection &out) const;
 
@@ -198,13 +279,32 @@ public:
     bool searchGroup(pid_t pid, const GroupScanOptions &opt, std::vector<Hit> &hits,
                      std::mutex &hitsMu, uint64_t &totalOut, bool &truncatedOut);
 
-    // 指针扫描：在指定内存段中查找指向 targetAddr 的引用
+    // 指针扫描：在指定内存段（支持只读数据段与代码段）中查找指向 targetAddr 的引用
     bool findPointers(pid_t pid, uint64_t targetAddr, int64_t maxOffset, size_t align,
-                      const std::vector<std::string> &tags, std::vector<PointerHit> &out) const;
+                      const std::vector<std::string> &tags,
+                      const std::string &scope,
+                      const std::string &nameFilter,
+                      std::vector<PointerHit> &out) const;
 
-    // 字符串/文本搜索（支持 utf8 与 utf16le）
+    // 代码交叉引用命中文本
+    struct CodeXRefHit {
+        uint64_t pc = 0;
+        std::string insnType; // "ADRP+ADD", "ADRP+LDR", "ADRP+STR", "ADR", "LDR_LITERAL", "LITERAL_PTR"
+        std::string disasm;   // 反汇编预览
+        std::string moduleName; // 相对模块说明，如 "libil2cpp.so+0x1234"
+        uint64_t targetAddr = 0;
+    };
+
+    // 代码段指令交叉引用反查 (AArch64 PC-Relative XRef Scan)
+    bool findCodeXrefs(pid_t pid, uint64_t targetAddr,
+                       const std::string &nameFilter,
+                       size_t maxResults,
+                       std::vector<CodeXRefHit> &out) const;
+
+    // 字符串/文本搜索（支持 utf8 与 utf16le，支持全段与只读段范围过滤）
     bool searchString(pid_t pid, const std::string &text, const std::string &encoding,
                       const std::string &nameFilter, const std::vector<std::string> &tags,
+                      const std::string &scope,
                       uint64_t maxResults, std::vector<Hit> &hits, std::mutex &hitsMu,
                       uint64_t &totalOut, bool &truncatedOut);
 

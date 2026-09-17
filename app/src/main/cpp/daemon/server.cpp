@@ -162,16 +162,94 @@ static bool parseAddr(const json &j, uint64_t &out) {
     return false;
 }
 
+static bool resolveBaseAddr(pid_t pid, const std::string &spec, uint64_t &addrOut) {
+    if (spec.empty()) return false;
+    size_t plus = spec.find('+');
+    if (plus != std::string::npos) {
+        std::string modName = spec.substr(0, plus);
+        std::string offStr = spec.substr(plus + 1);
+        int64_t off = (int64_t)strtoull(offStr.c_str(), nullptr, 0);
+
+        std::vector<Scanner::Module> mods;
+        if (Scanner::listModules(pid, mods)) {
+            for (const auto &m : mods) {
+                if (m.name.find(modName) != std::string::npos) {
+                    addrOut = m.base + off;
+                    return true;
+                }
+            }
+        }
+        return false;
+    }
+    return false;
+}
+
+static std::string toHex(const uint8_t *data, size_t len) {
+    static const char hexChars[] = "0123456789abcdef";
+    std::string s;
+    s.reserve(len * 2);
+    for (size_t i = 0; i < len; ++i) {
+        s.push_back(hexChars[(data[i] >> 4) & 0x0f]);
+        s.push_back(hexChars[data[i] & 0x0f]);
+    }
+    return s;
+}
+
+static std::string toBase64(const uint8_t *data, size_t len) {
+    static const char b64Chars[] = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+    std::string out;
+    out.reserve(((len + 2) / 3) * 4);
+    for (size_t i = 0; i < len; i += 3) {
+        uint32_t val = ((uint32_t)data[i]) << 16;
+        if (i + 1 < len) val |= ((uint32_t)data[i + 1]) << 8;
+        if (i + 2 < len) val |= ((uint32_t)data[i + 2]);
+
+        out.push_back(b64Chars[(val >> 18) & 0x3f]);
+        out.push_back(b64Chars[(val >> 12) & 0x3f]);
+        out.push_back((i + 1 < len) ? b64Chars[(val >> 6) & 0x3f] : '=');
+        out.push_back((i + 2 < len) ? b64Chars[val & 0x3f] : '=');
+    }
+    return out;
+}
+
+static std::string toAscii(const uint8_t *data, size_t len) {
+    std::string s;
+    s.reserve(len);
+    for (size_t i = 0; i < len; ++i) {
+        s.push_back((data[i] >= 32 && data[i] <= 126) ? (char)data[i] : '.');
+    }
+    return s;
+}
+
 static std::string readCmdlineName(pid_t pid) {
     char path[64];
     snprintf(path, sizeof(path), "/proc/%d/cmdline", pid);
     FILE *f = fopen(path, "r");
     if (!f) return "";
-    char buf[256] = {};
+    char buf[512] = {};
     size_t n = fread(buf, 1, sizeof(buf) - 1, f);
     fclose(f);
     if (n == 0) return "";
     std::string s(buf, strnlen(buf, n));
+
+    // 若 argv[0] 为 app_process，尝试在参数中提取真实包名或 --nice-name
+    if (s.find("app_process") != std::string::npos) {
+        size_t idx = s.size() + 1;
+        while (idx < n) {
+            size_t sublen = strnlen(buf + idx, n - idx);
+            if (sublen > 0) {
+                std::string arg(buf + idx, sublen);
+                if (arg.rfind("--nice-name=", 0) == 0) {
+                    return arg.substr(12);
+                }
+                if (arg.find('.') != std::string::npos && arg.find('/') == std::string::npos && arg[0] != '-') {
+                    return arg;
+                }
+            }
+            idx += sublen + 1;
+        }
+    }
+
     // 包名形式取整体；路径形式取 basename
     auto slash = s.rfind('/');
     if (slash != std::string::npos && s.find(' ') == std::string::npos)
@@ -222,8 +300,9 @@ std::string Server::dispatch(const std::string &reqStr) {
     if (cmd == "list_processes") {
         std::string filter = req.value("filter", "");
         std::transform(filter.begin(), filter.end(), filter.begin(), ::tolower);
-        bool all = req.value("all", false);
-        size_t limit = req.value("limit", (int64_t)25);
+        bool all = req.value("all", true);
+        size_t limit = req.value("limit", (int64_t)1000);
+        bool includeSystem = req.value("include_system", false);
 
         std::vector<json> arr;
         DIR *dir = opendir("/proc");
@@ -233,7 +312,7 @@ std::string Server::dispatch(const std::string &reqStr) {
             if (!isdigit((unsigned char)de->d_name[0])) continue;
             pid_t p = (pid_t)atoi(de->d_name);
             if (p == getpid()) continue;
-            // 只列 App 进程（uid >= 10000），过滤系统噪音
+
             char statPath[64];
             snprintf(statPath, sizeof(statPath), "/proc/%d/status", p);
             FILE *sf = fopen(statPath, "r");
@@ -247,10 +326,33 @@ std::string Server::dispatch(const std::string &reqStr) {
                 if (uid >= 0 && comm[0]) break;
             }
             fclose(sf);
-            if (uid < 10000) continue;
+
+            int appId = uid % 100000;
+            if (appId < 10000) continue; // 过滤系统底层基础服务
 
             std::string name = readCmdlineName(p);
             if (name.empty()) name = comm;
+
+            // 剔除修改器自身进程
+            if (name.find("com.luoli.modifier") != std::string::npos ||
+                name == "twt_svc" || name == "engine" || !strcmp(comm, "twt_svc")) {
+                continue;
+            }
+
+            // 剔除常见系统应用及服务（若未开启 include_system）
+            if (!includeSystem) {
+                if (name == "system_server" || name == "surfaceflinger") continue;
+                if (name.rfind("android.", 0) == 0) continue;
+                if (name.rfind("com.android.", 0) == 0) continue;
+                if (name.rfind("com.google.android.gms", 0) == 0) continue;
+                if (name.rfind("com.google.android.gsf", 0) == 0) continue;
+                if (name.rfind("com.google.android.ext.", 0) == 0) continue;
+                if (name.rfind("com.google.process.", 0) == 0) continue;
+                if (name.rfind("com.qualcomm.", 0) == 0) continue;
+                if (name.find("webview_zygote") != std::string::npos) continue;
+                if (name.find("dex2oat") != std::string::npos) continue;
+                if (name.find(":sandboxed_process") != std::string::npos) continue;
+            }
 
             if (!filter.empty()) {
                 std::string lowerName = name;
@@ -258,20 +360,33 @@ std::string Server::dispatch(const std::string &reqStr) {
                 if (lowerName.find(filter) == std::string::npos) continue;
             }
 
-            // 检查是否为前台/活跃进程 (cgroup cpuset:/foreground 或 top-app)
-            bool isForeground = false;
-            char cgroupPath[64];
-            snprintf(cgroupPath, sizeof(cgroupPath), "/proc/%d/cgroup", p);
-            FILE *cgf = fopen(cgroupPath, "r");
-            if (cgf) {
-                char cgLine[256];
-                while (fgets(cgLine, sizeof(cgLine), cgf)) {
-                    if (strstr(cgLine, "top-app") || strstr(cgLine, "cpuset:/foreground")) {
-                        isForeground = true;
-                        break;
+            // 读取 oom_score_adj（前台聚焦 Activity 的 oom_score_adj == 0）
+            int oomScore = 1000;
+            char oomPath[64];
+            snprintf(oomPath, sizeof(oomPath), "/proc/%d/oom_score_adj", p);
+            FILE *oomf = fopen(oomPath, "r");
+            if (oomf) {
+                if (fscanf(oomf, "%d", &oomScore) != 1) oomScore = 1000;
+                fclose(oomf);
+            }
+
+            // 检查 cgroup 是否为前台顶层应用
+            bool isForeground = (oomScore <= 0);
+            if (!isForeground) {
+                char cgroupPath[64];
+                snprintf(cgroupPath, sizeof(cgroupPath), "/proc/%d/cgroup", p);
+                FILE *cgf = fopen(cgroupPath, "r");
+                if (cgf) {
+                    char cgLine[256];
+                    while (fgets(cgLine, sizeof(cgLine), cgf)) {
+                        if (strstr(cgLine, "top-app") || strstr(cgLine, "cpuset:/top-app") ||
+                            strstr(cgLine, "cpuset:/foreground")) {
+                            isForeground = true;
+                            break;
+                        }
                     }
+                    fclose(cgf);
                 }
-                fclose(cgf);
             }
 
             arr.push_back(json{
@@ -279,16 +394,20 @@ std::string Server::dispatch(const std::string &reqStr) {
                 {"name", name},
                 {"uid", uid},
                 {"foreground", isForeground},
+                {"oom_score", oomScore},
             });
         }
         closedir(dir);
 
-        // 前台应用排在最前面
+        // 前台应用排在最前面，其次按 oomScore 升序，再次按名称
         std::sort(arr.begin(), arr.end(), [](const json &a, const json &b) {
             bool fa = a.value("foreground", false);
             bool fb = b.value("foreground", false);
             if (fa != fb) return fa > fb;
-            return a["pid"].get<int64_t>() < b["pid"].get<int64_t>();
+            int oa = a.value("oom_score", 1000);
+            int ob = b.value("oom_score", 1000);
+            if (oa != ob) return oa < ob;
+            return a.value("name", "") < b.value("name", "");
         });
 
         if (!all && arr.size() > limit) {
@@ -405,11 +524,32 @@ std::string Server::dispatch(const std::string &reqStr) {
 
     if (cmd == "who") {
         std::lock_guard<std::mutex> lk(stateMu_);
-        return okResp(id, json{
+        json resp{
             {"pid", (int64_t)pid_},
             {"name", procName_},
             {"attached", pid_ > 0},
-        }).dump();
+        };
+        if (pid_ > 0) {
+            Scanner::AppArchitectureSummary summary;
+            if (Scanner::inspectArchitecture(pid_, summary)) {
+                resp["arch"] = summary.arch;
+                resp["bitness"] = summary.bitness;
+                resp["engine"] = summary.engine;
+                json modsJson = json::array();
+                for (const auto &m : summary.coreModules) {
+                    char bStr[32];
+                    snprintf(bStr, sizeof(bStr), "0x%llx", (unsigned long long)m.base);
+                    modsJson.push_back(json{
+                        {"name", m.name},
+                        {"base", bStr},
+                        {"size", (int64_t)m.size},
+                        {"path", m.path}
+                    });
+                }
+                resp["core_modules"] = modsJson;
+            }
+        }
+        return okResp(id, resp).dump();
     }
 
     // ---- 以下命令需要附加（短暂取 pid，扫描不持 stateMu_，避免阻塞进度查询）----
@@ -422,7 +562,33 @@ std::string Server::dispatch(const std::string &reqStr) {
     }
     if (pid <= 0) return errResp(id, "not attached").dump();
 
-    // ---- 模块/区域 ----
+    // ---- 模块/区域/应用摘要 ----
+    if (cmd == "app_summary") {
+        Scanner::AppArchitectureSummary summary;
+        if (!Scanner::inspectArchitecture(pid, summary)) {
+            return errResp(id, "inspect architecture failed").dump();
+        }
+        json modsJson = json::array();
+        for (const auto &m : summary.coreModules) {
+            char bStr[32];
+            snprintf(bStr, sizeof(bStr), "0x%llx", (unsigned long long)m.base);
+            modsJson.push_back(json{
+                {"name", m.name},
+                {"base", bStr},
+                {"size", (int64_t)m.size},
+                {"path", m.path}
+            });
+        }
+        return okResp(id, json{
+            {"pid", (int64_t)pid},
+            {"name", procName},
+            {"arch", summary.arch},
+            {"bitness", summary.bitness},
+            {"engine", summary.engine},
+            {"core_modules", modsJson},
+        }).dump();
+    }
+
     if (cmd == "list_modules") {
         std::vector<Scanner::Module> mods;
         if (!Scanner::listModules(pid, mods)) return errResp(id, "maps read failed").dump();
@@ -680,6 +846,126 @@ std::string Server::dispatch(const std::string &reqStr) {
         }).dump();
     }
 
+    if (cmd == "read_bytes") {
+        if (!req.contains("addr")) return errResp(id, "missing addr").dump();
+        uint64_t addr = 0;
+        bool addrOk = false;
+        if (req["addr"].is_string()) {
+            addrOk = resolveBaseAddr(pid, req["addr"].get<std::string>(), addr);
+        }
+        if (!addrOk) {
+            addrOk = parseAddr(req["addr"], addr);
+        }
+        if (!addrOk) return errResp(id, "bad addr").dump();
+
+        size_t size = (size_t)req.value("size", (int64_t)256);
+        if (size == 0) size = 256;
+        if (size > 65536) size = 65536;
+
+        std::vector<uint8_t> bytes;
+        if (!scanner_.readBytes(pid, addr, size, bytes)) {
+            return errResp(id, "read bytes failed").dump();
+        }
+
+        std::string hexStr = toHex(bytes.data(), bytes.size());
+        std::string b64Str = toBase64(bytes.data(), bytes.size());
+        std::string asciiStr = toAscii(bytes.data(), bytes.size());
+
+        char aStr[32];
+        snprintf(aStr, sizeof(aStr), "0x%llx", (unsigned long long)addr);
+
+        return okResp(id, json{
+            {"addr", aStr},
+            {"size", (int64_t)bytes.size()},
+            {"hex", hexStr},
+            {"base64", b64Str},
+            {"ascii", asciiStr},
+        }).dump();
+    }
+
+    if (cmd == "read_struct") {
+        if (!req.contains("base")) return errResp(id, "missing base").dump();
+        uint64_t baseAddr = 0;
+        bool baseOk = false;
+        if (req["base"].is_string()) {
+            baseOk = resolveBaseAddr(pid, req["base"].get<std::string>(), baseAddr);
+        }
+        if (!baseOk) {
+            baseOk = parseAddr(req["base"], baseAddr);
+        }
+        if (!baseOk) return errResp(id, "bad base addr").dump();
+
+        if (!req.contains("fields") || !req["fields"].is_array()) {
+            return errResp(id, "missing or invalid fields array").dump();
+        }
+
+        std::vector<Scanner::StructFieldDef> fdefs;
+        for (const auto &item : req["fields"]) {
+            if (!item.is_object()) continue;
+            Scanner::StructFieldDef f;
+            f.name = item.value("name", "");
+            f.offset = item.value("offset", (int64_t)0);
+            f.typeStr = item.value("type", "i32");
+            f.strLen = (size_t)item.value("length", (int64_t)32);
+
+            std::string tLower = f.typeStr;
+            std::transform(tLower.begin(), tLower.end(), tLower.begin(), ::tolower);
+            if (tLower == "ptr" || tLower == "pointer") {
+                f.isPointer = true;
+            } else if (tLower == "str" || tLower == "string") {
+                f.isString = true;
+            } else {
+                VT vt;
+                if (vtFromString(tLower, vt)) {
+                    f.type = vt;
+                } else {
+                    f.type = VT::I32;
+                }
+            }
+            fdefs.push_back(f);
+        }
+
+        std::vector<Scanner::StructFieldValue> results;
+        if (!scanner_.readStruct(pid, baseAddr, fdefs, results)) {
+            return errResp(id, "read struct failed").dump();
+        }
+
+        char bStr[32];
+        snprintf(bStr, sizeof(bStr), "0x%llx", (unsigned long long)baseAddr);
+
+        std::vector<json> farr;
+        for (const auto &r : results) {
+            char ab[32];
+            snprintf(ab, sizeof(ab), "0x%llx", (unsigned long long)r.addr);
+            char rb[32];
+            snprintf(rb, sizeof(rb), "0x%llx", (unsigned long long)r.raw);
+
+            json fobj{
+                {"name", r.name},
+                {"offset", r.offset},
+                {"addr", ab},
+                {"type", r.type},
+                {"ok", r.ok},
+            };
+            if (r.isString) {
+                fobj["value"] = r.strValue;
+            } else if (r.isPointer) {
+                fobj["value"] = r.strValue;
+                fobj["raw"] = rb;
+            } else {
+                fobj["value"] = r.numValue;
+                fobj["raw"] = rb;
+            }
+            farr.push_back(fobj);
+        }
+
+        return okResp(id, json{
+            {"base", bStr},
+            {"fields", farr},
+            {"total_fields", (int64_t)farr.size()},
+        }).dump();
+    }
+
     if (cmd == "search_group") {
         if (scanning_.load()) return errResp(id, "scan already running").dump();
         if (!driver_.ready()) return errResp(id, "driver not ready").dump();
@@ -736,6 +1022,10 @@ std::string Server::dispatch(const std::string &reqStr) {
         if (!parseAddr(req["target_addr"], targetAddr)) return errResp(id, "bad target_addr").dump();
         int64_t maxOffset = req.value("max_offset", (int64_t)0);
         size_t align = (size_t)req.value("align", (int64_t)8);
+        std::string scope = req.value("scope", "all");
+        if (req.value("include_rodata", false)) scope = "all";
+        if (req.value("include_code", false)) scope = "all";
+        std::string nameFilter = req.value("name_filter", "");
         std::vector<std::string> tags;
         if (req.contains("tags")) {
             if (req["tags"].is_array()) {
@@ -745,7 +1035,7 @@ std::string Server::dispatch(const std::string &reqStr) {
             }
         }
         std::vector<PointerHit> hits;
-        if (!scanner_.findPointers(pid, targetAddr, maxOffset, align, tags, hits)) {
+        if (!scanner_.findPointers(pid, targetAddr, maxOffset, align, tags, scope, nameFilter, hits)) {
             return errResp(id, "find pointers failed").dump();
         }
         std::vector<json> arr;
@@ -759,9 +1049,56 @@ std::string Server::dispatch(const std::string &reqStr) {
                 {"offset", h.offset},
                 {"tag", h.regionTag},
                 {"module", h.moduleName},
+                {"writable", h.writable},
             });
         }
         return okResp(id, json{{"total", (int64_t)hits.size()}, {"pointers", arr}}).dump();
+    }
+
+    if (cmd == "find_code_xrefs") {
+        if (!driver_.ready()) return errResp(id, "driver not ready").dump();
+        if (!req.contains("target_addr")) return errResp(id, "missing target_addr").dump();
+
+        uint64_t targetAddr = 0;
+        bool addrOk = false;
+        if (req["target_addr"].is_string()) {
+            addrOk = resolveBaseAddr(pid, req["target_addr"].get<std::string>(), targetAddr);
+        }
+        if (!addrOk) {
+            addrOk = parseAddr(req["target_addr"], targetAddr);
+        }
+        if (!addrOk || targetAddr == 0) return errResp(id, "bad target_addr").dump();
+
+        std::string nameFilter = req.value("module", "");
+        if (nameFilter.empty()) nameFilter = req.value("name_filter", "");
+        size_t maxResults = (size_t)req.value("max", (int64_t)50);
+
+        std::vector<Scanner::CodeXRefHit> xrefs;
+        if (!scanner_.findCodeXrefs(pid, targetAddr, nameFilter, maxResults, xrefs)) {
+            return errResp(id, "find code xrefs failed or no references found").dump();
+        }
+
+        char tStr[32];
+        snprintf(tStr, sizeof(tStr), "0x%llx", (unsigned long long)targetAddr);
+
+        std::vector<json> arr;
+        for (const auto &x : xrefs) {
+            char pStr[32];
+            snprintf(pStr, sizeof(pStr), "0x%llx", (unsigned long long)x.pc);
+            arr.push_back(json{
+                {"pc", pStr},
+                {"type", x.insnType},
+                {"disasm", x.disasm},
+                {"module", x.moduleName},
+                {"target", tStr},
+            });
+        }
+
+        return okResp(id, json{
+            {"target_addr", tStr},
+            {"total", (int64_t)arr.size()},
+            {"xrefs", arr},
+        }).dump();
     }
 
     if (cmd == "search_string") {
@@ -771,6 +1108,13 @@ std::string Server::dispatch(const std::string &reqStr) {
         std::string text = req["text"].get<std::string>();
         std::string encoding = req.value("encoding", "utf8");
         std::string nameFilter = req.value("name_filter", "");
+        std::string scope = req.value("scope", "");
+        if (scope.empty()) {
+            if (req.value("all_segments", false)) scope = "all";
+            else if (req.value("include_rodata", false)) scope = "include_rodata";
+            else if (req.contains("writable_only") && !req["writable_only"].get<bool>()) scope = "all";
+            else scope = "writable";
+        }
         std::vector<std::string> tags;
         if (req.contains("tags")) {
             if (req["tags"].is_array()) {
@@ -788,7 +1132,7 @@ std::string Server::dispatch(const std::string &reqStr) {
             std::lock_guard<std::mutex> hl(hitsMu_);
             hits_.clear();
         }
-        bool ok = scanner_.searchString(pid, text, encoding, nameFilter, tags, maxResults, hits_, hitsMu_, total, truncated);
+        bool ok = scanner_.searchString(pid, text, encoding, nameFilter, tags, scope, maxResults, hits_, hitsMu_, total, truncated);
         scanning_.store(false);
         if (!ok) return errResp(id, "search string failed").dump();
         return okResp(id, json{{"count", (int64_t)total}, {"truncated", truncated}}).dump();
@@ -1265,6 +1609,7 @@ std::string Server::dispatch(const std::string &reqStr) {
             {"module_path", st.modulePath},
             {"has_metadata", st.hasMetadata},
             {"metadata_addr", mb},
+            {"metadata_version", st.metadataVersion},
             {"api_count", (int64_t)st.apiCount},
         }).dump();
     }

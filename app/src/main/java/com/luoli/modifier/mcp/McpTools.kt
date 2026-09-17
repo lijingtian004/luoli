@@ -6,6 +6,7 @@ import com.luoli.modifier.core.EngineRepo
 import com.luoli.modifier.core.SettingsStore
 import kotlinx.serialization.json.Json
 import kotlinx.serialization.json.JsonArray
+import kotlinx.serialization.json.JsonElement
 import kotlinx.serialization.json.JsonObject
 import kotlinx.serialization.json.JsonPrimitive
 import kotlinx.serialization.json.buildJsonArray
@@ -25,16 +26,28 @@ object McpTools {
 
     private fun client() = EngineClient()
 
-    // ---------- 结果封装 ----------
+    // ---------- 结果封装与包名脱敏 ----------
+
+    private fun sanitizeResponse(text: String): String {
+        val attachedName = EngineRepo.attached.value?.name
+        val pkg = attachedName ?: runCatching {
+            kotlinx.coroutines.runBlocking { client().request("who") }["name"]?.jsonPrimitive?.contentOrNull
+        }.getOrNull().orEmpty()
+        return if (pkg.isNotEmpty()) {
+            text.replace(pkg, "[target_app]")
+        } else {
+            text
+        }
+    }
 
     private fun toolOk(json: String) =
         io.modelcontextprotocol.kotlin.sdk.types.CallToolResult(
-            content = listOf(io.modelcontextprotocol.kotlin.sdk.types.TextContent(json))
+            content = listOf(io.modelcontextprotocol.kotlin.sdk.types.TextContent(sanitizeResponse(json)))
         )
 
     private fun toolErr(msg: String) =
         io.modelcontextprotocol.kotlin.sdk.types.CallToolResult(
-            content = listOf(io.modelcontextprotocol.kotlin.sdk.types.TextContent(msg)),
+            content = listOf(io.modelcontextprotocol.kotlin.sdk.types.TextContent(sanitizeResponse(msg))),
             isError = true,
         )
 
@@ -48,6 +61,9 @@ object McpTools {
 
     private fun JsonObject?.intArg(name: String): Int? =
         this?.get(name)?.jsonPrimitive?.intOrNull
+
+    private fun JsonObject?.boolArg(name: String): Boolean? =
+        this?.get(name)?.jsonPrimitive?.booleanOrNull
 
     private fun JsonObject?.addrArg(name: String = "addr"): Long? {
         val v = this?.get(name) ?: return null
@@ -139,59 +155,37 @@ object McpTools {
             ok("result" to client().request("stealth_status"))
         }
 
-        reg("list_processes", "List running app processes (uid>=10000). Foreground focus app is prioritized at the top.",
-            schema(
-                "filter" to prop("string", "process name filter substring (e.g. 'mindustry' or 'game')"),
-                "limit" to prop("integer", "max items to return (default 25)"),
-                "all" to prop("boolean", "return all processes without truncation (default false)"),
-            )) { args ->
-            val resp = client().request("list_processes") {
-                args.str("filter")?.let { put("filter", it) }
-                args.intArg("limit")?.let { put("limit", it) }
-                args?.get("all")?.let { put("all", it) }
-            }
-            val arr = resp["processes"]?.jsonArray ?: JsonArray(emptyList())
-            ok("total" to (resp["total"] ?: JsonPrimitive(arr.size)), "processes" to arr)
-        }
-
-        reg("attach", "Attach to a target process by pid.",
-            schema("pid" to prop("integer", "target process pid"))) { args ->
-            val pid = args.intArg("pid") ?: return@reg toolErr("missing pid")
-            EngineRepo.attach(pid)
-            val att = EngineRepo.attached.value
-            if (att == null) toolErr("attach failed")
-            else ok("result" to JsonPrimitive("attached ${att.name} (pid=${att.pid})"))
-        }
-
-        reg("attach_by_name", "Attach to a target process by name/package (kernel GET_PID).",
-            schema("name" to prop("string", "process name or package name, e.g. com.xxx.yyy"))) { args ->
-            val name = args.str("name") ?: return@reg toolErr("missing name")
-            EngineRepo.attachByName(name)
-            val att = EngineRepo.attached.value
-            if (att == null) toolErr("attach failed")
-            else ok("result" to JsonPrimitive("attached ${att.name} (pid=${att.pid})"))
-        }
-
-        reg("detach", "Detach from current process and clear scan results.", schema()) {
-            EngineRepo.detach()
-            ok("result" to JsonPrimitive("detached"))
-        }
-
-        reg("get_status", "Get engine status: attached process, driver, scan progress, result count, frozen entries.",
+        reg("get_status", "Get engine status: whether target process is attached (target process is manually selected by user in UI), target app architecture summary (engine type, bitness, core modules), driver, scan progress, result count, frozen entries.",
             schema()) {
             val who = runCatching { client().request("who") }.getOrNull()
             val ds = runCatching { client().request("driver_status") }.getOrNull()
             val prog = runCatching { client().request("scan_progress") }.getOrNull()
             val frozen = runCatching { client().request("frozen_list") }.getOrNull()
-            ok(
-                "attached" to (who?.get("name")?.jsonPrimitive ?: JsonPrimitive("")),
-                "pid" to (who?.get("pid")?.jsonPrimitive ?: JsonPrimitive(0)),
+            val isAttached = (who?.get("attached")?.jsonPrimitive?.booleanOrNull == true) &&
+                    ((who.get("pid")?.jsonPrimitive?.intOrNull ?: 0) > 0)
+            val pairs = mutableListOf<Pair<String, JsonElement>>(
+                "attached" to JsonPrimitive(isAttached),
                 "driver_ready" to (ds?.get("ready")?.jsonPrimitive ?: JsonPrimitive(false)),
                 "driver_mode" to (ds?.get("mode")?.jsonPrimitive ?: JsonPrimitive("")),
                 "scan_running" to (prog?.get("running")?.jsonPrimitive ?: JsonPrimitive(false)),
                 "result_count" to (prog?.get("found")?.jsonPrimitive ?: JsonPrimitive(0)),
                 "frozen_count" to (frozen?.get("entries")?.jsonArray?.size?.let { JsonPrimitive(it) } ?: JsonPrimitive(0)),
             )
+            if (isAttached && who != null) {
+                who["name"]?.let { pairs.add("target_name" to it) }
+                who["pid"]?.let { pairs.add("target_pid" to it) }
+                who["arch"]?.let { pairs.add("arch" to it) }
+                who["bitness"]?.let { pairs.add("bitness" to it) }
+                who["engine"]?.let { pairs.add("engine" to it) }
+                who["core_modules"]?.let { pairs.add("core_modules" to it) }
+            }
+            ok(*pairs.toTypedArray())
+        }
+
+        reg("app_summary", "Get target application architecture summary (main engine type, architecture bitness, core modules overview).",
+            schema()) {
+            val resp = client().request("app_summary")
+            ok("summary" to resp)
         }
 
         // ---- 模块 ----
@@ -297,12 +291,14 @@ object McpTools {
             ok("count" to JsonPrimitive(count), "note" to JsonPrimitive("now change value in game and use filter(op='dec'/'inc'/'changed'/'unchanged')"))
         }
 
-        reg("search_string", "Search memory for a UTF-8 or UTF-16LE text string.",
+        reg("search_string", "Search memory for a UTF-8 or UTF-16LE text string (supports writable, rodata, code, or all segments).",
             schema(
                 "text" to prop("string", "text string to search"),
                 "encoding" to prop("string", "encoding: 'utf8' or 'utf16' (default 'utf8')"),
-                "tags" to prop("string", "comma-separated region classification tags (e.g. 'Jh,A')"),
-                "name_filter" to prop("string", "region path substring filter"),
+                "scope" to prop("string", "memory segment scope: 'writable' (default), 'rodata' (read-only data/constants), 'code' (executable code), or 'all' (all readable segments)"),
+                "all_segments" to prop("boolean", "shortcut to scan all readable segments (default false)"),
+                "tags" to prop("string", "comma-separated region classification tags (e.g. 'Jh,A' or 'Ca,rodata')"),
+                "name_filter" to prop("string", "region path substring filter (e.g. 'libil2cpp.so')"),
                 "max" to prop("integer", "max results cap (default 100000)"),
             )) { args ->
             val text = args.str("text") ?: return@reg toolErr("missing text")
@@ -310,6 +306,8 @@ object McpTools {
             val resp = client().request("search_string") {
                 put("text", text)
                 put("encoding", args.str("encoding") ?: "utf8")
+                args.str("scope")?.let { put("scope", it) }
+                args.boolArg("all_segments")?.let { put("all_segments", it) }
                 put("name_filter", args.str("name_filter") ?: "")
                 if (tags.isNotEmpty()) {
                     put("tags", buildJsonArray { tags.forEach { add(JsonPrimitive(it)) } })
@@ -431,12 +429,84 @@ object McpTools {
             else ok("summary" to JsonPrimitive(summary))
         }
 
-        reg("find_pointers", "Find pointers/references pointing to target address (pointer scanning).",
+        reg("read_bytes", "Read a contiguous memory block directly (64 to 65536 bytes) without disk I/O, returned in hex/base64/ascii.",
+            schema(
+                "addr" to prop("string", "memory address (0x-hex or 'libxxx.so+0x1234')"),
+                "size" to prop("integer", "number of bytes to read (default 256, max 65536)"),
+            )) { args ->
+            val addr = args.str("addr") ?: return@reg toolErr("missing addr")
+            val size = args.intArg("size") ?: 256
+            val resp = client().request("read_bytes") {
+                put("addr", addr)
+                put("size", size)
+            }
+            val errStr = resp["err"]?.jsonPrimitive?.contentOrNull
+            if (errStr != null) toolErr(errStr)
+            else ok(
+                "addr" to (resp["addr"] ?: JsonPrimitive(addr)),
+                "size" to (resp["size"] ?: JsonPrimitive(size)),
+                "hex" to (resp["hex"] ?: JsonPrimitive("")),
+                "base64" to (resp["base64"] ?: JsonPrimitive("")),
+                "ascii" to (resp["ascii"] ?: JsonPrimitive("")),
+            )
+        }
+
+        reg("read_struct", "Read multiple structured fields at relative offsets from a base address in a single pass (batch struct unpacking).",
+            schema(
+                "base" to prop("string", "base memory address (0x-hex or 'libxxx.so+0x1234')"),
+                "fields" to prop("string", "JSON array of field definitions e.g. [{'name':'vtable','offset':0,'type':'ptr'},{'name':'hp','offset':16,'type':'i32'}] or shorthand string '0:ptr:vtable, 16:i32:hp'"),
+            )) { args ->
+            val base = args.str("base") ?: return@reg toolErr("missing base")
+            val fieldsJson = args?.get("fields") ?: return@reg toolErr("missing fields")
+            val fieldsArray = buildJsonArray {
+                if (fieldsJson is JsonArray) {
+                    fieldsJson.forEach { add(it) }
+                } else if (fieldsJson is JsonPrimitive && fieldsJson.isString) {
+                    val str = fieldsJson.content.trim()
+                    if (str.startsWith("[")) {
+                        val parsed = runCatching { Json.parseToJsonElement(str).jsonArray }.getOrNull()
+                        parsed?.forEach { add(it) }
+                    } else {
+                        str.split(",").map { it.trim() }.filter { it.isNotEmpty() }.forEach { part ->
+                            val tokens = part.split(":").map { it.trim() }
+                            if (tokens.isNotEmpty()) {
+                                val off = try { EngineProtocol.hexToLong(tokens[0]) } catch (t: Throwable) { 0L }
+                                val type = if (tokens.size > 1) tokens[1] else "i32"
+                                val name = if (tokens.size > 2) tokens[2] else "field_${off}"
+                                add(buildJsonObject {
+                                    put("offset", off)
+                                    put("type", type)
+                                    put("name", name)
+                                })
+                            }
+                        }
+                    }
+                }
+            }
+
+            if (fieldsArray.isEmpty()) return@reg toolErr("empty or invalid fields definition")
+
+            val resp = client().request("read_struct") {
+                put("base", base)
+                put("fields", fieldsArray)
+            }
+            val errStr = resp["err"]?.jsonPrimitive?.contentOrNull
+            if (errStr != null) toolErr(errStr)
+            else ok(
+                "base" to (resp["base"] ?: JsonPrimitive(base)),
+                "fields" to (resp["fields"] ?: JsonArray(emptyList())),
+                "total_fields" to (resp["total_fields"] ?: JsonPrimitive(fieldsArray.size)),
+            )
+        }
+
+        reg("find_pointers", "Find pointers/references pointing to target address (pointer scanning, supports read-only data & code segments).",
             schema(
                 "target_addr" to prop("string", "target memory address to find references to"),
                 "max_offset" to prop("integer", "max interior pointer offset in bytes (default 0 for exact pointer)"),
                 "align" to prop("integer", "pointer alignment in bytes: 4 or 8 (default 8)"),
-                "tags" to prop("string", "comma-separated region tags to search in (e.g. 'B,Jh,Ch'; default BSS and Heaps)"),
+                "scope" to prop("string", "memory segment scope: 'all' (default, includes rodata & code), 'writable', 'rodata' (read-only data/vtables), or 'code'"),
+                "tags" to prop("string", "comma-separated region tags to search in (e.g. 'Ca,Cd,B,rodata,code'; default includes app modules, rodata, code, bss, heaps)"),
+                "name_filter" to prop("string", "module name substring filter (e.g. 'libil2cpp.so')"),
             )) { args ->
             val targetAddr = args.addrArg("target_addr") ?: return@reg toolErr("missing/bad target_addr")
             val tags = args.str("tags")?.split(",")?.map { it.trim() }?.filter { it.isNotEmpty() } ?: emptyList()
@@ -444,11 +514,30 @@ object McpTools {
                 put("target_addr", targetAddr)
                 put("max_offset", args.intArg("max_offset") ?: 0)
                 put("align", args.intArg("align") ?: 8)
+                args.str("scope")?.let { put("scope", it) }
+                args.str("name_filter")?.let { put("name_filter", it) }
                 if (tags.isNotEmpty()) {
                     put("tags", buildJsonArray { tags.forEach { add(JsonPrimitive(it)) } })
                 }
             }
             ok("result" to resp)
+        }
+
+        reg("find_code_xrefs", "Find machine instruction cross-references (xrefs) to a target address in code segments (ADRP+ADD/LDR/STR, ADR, LDR literal).",
+            schema(
+                "target_addr" to prop("string", "target memory address to find references to (0x-hex or 'libxxx.so+0x1234')"),
+                "module" to prop("string", "optional module name filter (e.g. 'libil2cpp.so'); empty = all app code segments"),
+                "max" to prop("integer", "max results to return (default 50, max 500)"),
+            )) { args ->
+            val targetAddr = args.str("target_addr") ?: return@reg toolErr("missing target_addr")
+            val resp = client().request("find_code_xrefs") {
+                put("target_addr", targetAddr)
+                args.str("module")?.let { put("module", it) }
+                args.intArg("max")?.let { put("max", it) }
+            }
+            val errStr = resp["err"]?.jsonPrimitive?.contentOrNull
+            if (errStr != null) toolErr(errStr)
+            else ok("result" to resp)
         }
 
         reg("resolve_pointer_chain", "Resolve and dereference multi-level pointer paths (e.g. 'base+offset1->offset2->value').",
@@ -727,7 +816,7 @@ object McpTools {
 
         // ---- Unity IL2CPP 探针 ----
 
-        reg("il2cpp_status", "Probe target process for Unity IL2CPP runtime, libil2cpp.so base, and global-metadata.dat mapping.", schema()) {
+        reg("il2cpp_status", "Probe target process for Unity IL2CPP runtime, libil2cpp.so base, metadata version, and global-metadata.dat mapping.", schema()) {
             ok("result" to client().request("il2cpp_status"))
         }
 
@@ -735,7 +824,7 @@ object McpTools {
             ok("result" to client().request("il2cpp_apis"))
         }
 
-        reg("il2cpp_find_class", "Search in-memory IL2CPP global-metadata for class names and extract fields with runtime memory offsets.",
+        reg("il2cpp_find_class", "Search in-memory IL2CPP global-metadata (v24..v31+ adaptive multi-version) for class names and extract fields with runtime memory offsets.",
             schema(
                 "class" to prop("string", "class name or substring to find (e.g. 'Player', 'Inventory', 'GameManager')"),
             )) { args ->

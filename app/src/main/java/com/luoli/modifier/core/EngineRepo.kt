@@ -33,9 +33,21 @@ data class DaemonStatus(
     val driverMode: String = "",
 )
 
-data class AttachedInfo(val pid: Int, val name: String)
+data class AttachedInfo(
+    val pid: Int,
+    val name: String,
+    val arch: String = "",
+    val bitness: Int = 0,
+    val engine: String = "",
+)
 
-data class ProcessUi(val pid: Int, val name: String, val uid: Int)
+data class ProcessUi(
+    val pid: Int,
+    val name: String,
+    val uid: Int,
+    val foreground: Boolean = false,
+    val label: String = "",
+)
 
 data class HitUi(val addr: Long, val type: String, val bits: Long, val value: Double)
 
@@ -76,6 +88,19 @@ object EngineRepo {
 
     // ---------- daemon 生命周期 ----------
 
+    private fun parseAttached(who: JsonObject?): AttachedInfo? {
+        if (who?.get("attached")?.jsonPrimitive?.booleanOrNull != true) return null
+        val pid = who["pid"]?.jsonPrimitive?.intOrNull ?: 0
+        if (pid <= 0) return null
+        return AttachedInfo(
+            pid = pid,
+            name = who["name"]?.jsonPrimitive?.contentOrNull ?: "",
+            arch = who["arch"]?.jsonPrimitive?.contentOrNull ?: "",
+            bitness = who["bitness"]?.jsonPrimitive?.intOrNull ?: 0,
+            engine = who["engine"]?.jsonPrimitive?.contentOrNull ?: "",
+        )
+    }
+
     suspend fun refreshStatus() {
         val running = DaemonManager.isRunning()
         if (!running) {
@@ -91,14 +116,7 @@ object EngineRepo {
             driverMode = ds?.get("mode")?.jsonPrimitive?.contentOrNull ?: "",
         )
         val who = runCatching { client().request("who") }.getOrNull()
-        if (who?.get("attached")?.jsonPrimitive?.booleanOrNull == true) {
-            _attached.value = AttachedInfo(
-                who["pid"]?.jsonPrimitive?.intOrNull ?: 0,
-                who["name"]?.jsonPrimitive?.contentOrNull ?: "",
-            )
-        } else {
-            _attached.value = null
-        }
+        _attached.value = parseAttached(who)
     }
 
     suspend fun startDaemon(ctx: Context) {
@@ -133,18 +151,56 @@ object EngineRepo {
 
     // ---------- 进程 ----------
 
-    suspend fun listProcesses(): List<ProcessUi> {
-        val resp = runCatching { client().request("list_processes") }.getOrNull()
-            ?: return emptyList()
+    suspend fun listProcesses(ctx: Context? = null, includeSystem: Boolean = false): List<ProcessUi> {
+        val resp = runCatching {
+            client().request("list_processes") {
+                put("all", true)
+                put("include_system", includeSystem)
+            }
+        }.getOrNull() ?: return emptyList()
+
         val arr = resp["processes"]?.jsonArray ?: return emptyList()
-        return arr.mapNotNull { el ->
+        val pm = ctx?.packageManager
+        val myPkg = ctx?.packageName ?: "com.luoli.modifier"
+        val myPid = android.os.Process.myPid()
+
+        val list = arr.mapNotNull { el ->
             val o = el.jsonObject
+            val pid = o["pid"]?.jsonPrimitive?.intOrNull ?: return@mapNotNull null
+            val name = o["name"]?.jsonPrimitive?.contentOrNull ?: ""
+            val uid = o["uid"]?.jsonPrimitive?.intOrNull ?: 0
+            val fg = o["foreground"]?.jsonPrimitive?.booleanOrNull ?: false
+
+            // 过滤自身与看门狗
+            if (pid == myPid || name.startsWith(myPkg) || name == "twt_svc" || name == "engine") {
+                return@mapNotNull null
+            }
+
+            val pkg = name.substringBefore(':')
+            var label = ""
+            var isSys = false
+            if (pm != null) {
+                try {
+                    val appInfo = pm.getApplicationInfo(pkg, 0)
+                    isSys = (appInfo.flags and android.content.pm.ApplicationInfo.FLAG_SYSTEM) != 0
+                    label = pm.getApplicationLabel(appInfo).toString()
+                } catch (_: Throwable) {}
+            }
+            if (!includeSystem && isSys) return@mapNotNull null
+
             ProcessUi(
-                pid = o["pid"]?.jsonPrimitive?.intOrNull ?: return@mapNotNull null,
-                name = o["name"]?.jsonPrimitive?.contentOrNull ?: "",
-                uid = o["uid"]?.jsonPrimitive?.intOrNull ?: 0,
+                pid = pid,
+                name = name,
+                uid = uid,
+                foreground = fg,
+                label = if (label.isNotEmpty() && label != name) label else "",
             )
-        }.sortedBy { it.name }
+        }
+
+        return list.sortedWith(
+            compareByDescending<ProcessUi> { it.foreground }
+                .thenBy { (it.label.ifEmpty { it.name }).lowercase() }
+        )
     }
 
     suspend fun attach(pid: Int) {
@@ -153,10 +209,10 @@ object EngineRepo {
                 val e = err(resp)
                 if (e != null) toast.emit("附加失败: $e")
                 else {
-                    _attached.value = AttachedInfo(pid, resp["name"]?.jsonPrimitive?.contentOrNull ?: "")
+                    refreshStatus()
                     _hits.value = emptyList()
                     _total.value = 0
-                    toast.emit("已附加 ${_attached.value?.name}")
+                    toast.emit("已附加 ${_attached.value?.name ?: pid.toString()}")
                 }
             }
             .onFailure { toast.emit("附加失败: ${it.message}") }
@@ -168,11 +224,10 @@ object EngineRepo {
                 val e = err(resp)
                 if (e != null) toast.emit("附加失败: $e")
                 else {
-                    val pid = resp["pid"]?.jsonPrimitive?.intOrNull ?: 0
-                    _attached.value = AttachedInfo(pid, resp["name"]?.jsonPrimitive?.contentOrNull ?: name)
+                    refreshStatus()
                     _hits.value = emptyList()
                     _total.value = 0
-                    toast.emit("已附加 ${_attached.value?.name} (pid=$pid)")
+                    toast.emit("已附加 ${_attached.value?.name ?: name}")
                 }
             }
             .onFailure { toast.emit("附加失败: ${it.message}") }
@@ -208,12 +263,8 @@ object EngineRepo {
     suspend fun search(type: String, valueText: String, align: Int, nameFilter: String, tags: List<String> = emptyList()) {
         if (_attached.value == null) {
             val who = runCatching { client().request("who") }.getOrNull()
-            if (who?.get("attached")?.jsonPrimitive?.booleanOrNull == true) {
-                _attached.value = AttachedInfo(
-                    who["pid"]?.jsonPrimitive?.intOrNull ?: 0,
-                    who["name"]?.jsonPrimitive?.contentOrNull ?: "",
-                )
-            } else {
+            _attached.value = parseAttached(who)
+            if (_attached.value == null) {
                 toast.emit("请先附加进程")
                 return
             }
@@ -252,12 +303,7 @@ object EngineRepo {
     suspend fun searchGroup(patterns: List<JsonObject>, baseAlign: Int = 4, nameFilter: String = "", tags: List<String> = emptyList()): Long {
         if (_attached.value == null) {
             val who = runCatching { client().request("who") }.getOrNull()
-            if (who?.get("attached")?.jsonPrimitive?.booleanOrNull == true) {
-                _attached.value = AttachedInfo(
-                    who["pid"]?.jsonPrimitive?.intOrNull ?: 0,
-                    who["name"]?.jsonPrimitive?.contentOrNull ?: "",
-                )
-            }
+            _attached.value = parseAttached(who)
         }
         val resp = client().request("search_group") {
             put("patterns", buildJsonArray { patterns.forEach { add(it) } })
@@ -345,6 +391,29 @@ object EngineRepo {
                 refreshResults()
             }
             .onFailure { toast.emit("写入失败: ${it.message}") }
+    }
+
+    suspend fun batchWrite(type: String, valueText: String): Int {
+        val value = parseValue(type, valueText) ?: run { toast.emit("数值无效"); return 0 }
+        val currentHits = _hits.value
+        if (currentHits.isEmpty()) {
+            toast.emit("无可用搜索结果")
+            return 0
+        }
+        var count = 0
+        currentHits.forEach { h ->
+            val res = runCatching {
+                client().request("write") {
+                    put("addr", h.addr)
+                    put("type", type)
+                    put("value", value)
+                }
+            }.getOrNull()
+            if (res != null && err(res) == null) count++
+        }
+        toast.emit("批量修改完成: $count/${currentHits.size}")
+        refreshResults()
+        return count
     }
 
     // ---------- 冻结 ----------
